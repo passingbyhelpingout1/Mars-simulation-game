@@ -6,12 +6,82 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Set
+from heapq import heappush, heappop
+from typing import Dict, List, Optional, Tuple, Set, Callable
 
 
-# ----------------------------- Map Model -------------------------------------
+# ----------------------------- A* Pathfinding ---------------------------------
+
+Pos = Tuple[int, int]
+
+
+@dataclass(frozen=True)
+class PathResult:
+    path: List[Pos]   # [start, ..., goal]
+    cost: float       # accumulated movement cost along the path
+    expanded: int     # number of nodes expanded (debug/profiling)
+
+
+def _octile(a: Pos, b: Pos) -> float:
+    """Heuristic for 8-directional grids; Manhattan if diagonals not used."""
+    dx, dy = abs(a[0] - b[0]), abs(a[1] - b[1])
+    return (max(dx, dy) - min(dx, dy)) + math.sqrt(2) * min(dx, dy)
+
+
+def astar(
+    start: Pos,
+    goal: Pos,
+    passable: Callable[[Pos], bool],
+    move_cost: Callable[[Pos, Pos], float],
+    allow_diagonals: bool = True,
+) -> Optional[PathResult]:
+    """A* search on a grid. Returns None if no path exists."""
+    if start == goal:
+        return PathResult([start], 0.0, 0)
+
+    steps = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    if allow_diagonals:
+        steps += [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+
+    openq: List[Tuple[float, float, Pos]] = []
+    heappush(openq, (0.0, 0.0, start))
+    g: Dict[Pos, float] = {start: 0.0}
+    parent: Dict[Pos, Pos] = {}
+    expanded = 0
+
+    while openq:
+        _, g_here, cur = heappop(openq)
+        expanded += 1
+        if cur == goal:
+            # Reconstruct path
+            out: List[Pos] = [cur]
+            while cur in parent:
+                cur = parent[cur]
+                out.append(cur)
+            out.reverse()
+            return PathResult(out, g_here, expanded)
+
+        cx, cy = cur
+        for dx, dy in steps:
+            nxt = (cx + dx, cy + dy)
+            if not passable(nxt):
+                continue
+            step_cost = move_cost((cx, cy), nxt)
+            if not (step_cost > 0.0 and math.isfinite(step_cost)):
+                continue
+            cand = g_here + step_cost
+            if cand < g.get(nxt, float("inf")):
+                g[nxt] = cand
+                parent[nxt] = (cx, cy)
+                h = _octile(nxt, goal) if allow_diagonals else (abs(nxt[0] - goal[0]) + abs(nxt[1] - goal[1]))
+                heappush(openq, (cand + h, cand, nxt))
+
+    return None
+
+
+# ----------------------------- Map Model --------------------------------------
 
 class TileType(str, Enum):
     PLAINS = "plains"
@@ -109,22 +179,55 @@ class WorldMap:
             raise IndexError("coordinate outside world bounds")
         return self._gen_tile(x, y)
 
-    def reveal(self, x: int, y: int, radius: int = 0):
-        for yy in range(y - radius, y + radius + 1):
-            for xx in range(x - radius, x + radius + 1):
-                if not (-(self.w // 2) <= xx <= (self.w // 2)):
-                    continue
-                if not (-(self.h // 2) <= yy <= (self.h // 2)):
-                    continue
-                self._discovered.add((xx, yy))
+    # ---- NEW: navigation helpers for pathfinding ----
 
-    def visit(self, x: int, y: int):
-        self._discovered.add((x, y))
-        self._visits[(x, y)] = self._visits.get((x, y), 0) + 1
+    def in_bounds(self, p: Tuple[int, int]) -> bool:
+        x, y = p
+        return (-(self.w // 2) <= x <= (self.w // 2)) and (-(self.h // 2) <= y <= (self.h // 2))
+
+    def revealed(self, p: Tuple[int, int]) -> bool:
+        return p in self._discovered
+
+    def passable(self, p: Tuple[int, int]) -> bool:
+        # All in-bounds tiles are traversable for now; you can tighten this later
+        # (e.g., extremely hazardous cells or special obstacles).
+        return self.in_bounds(p)
+
+    def tile_base_cost(self, p: Tuple[int, int]) -> float:
+        """
+        Base per-tile move cost derived from terrain type and hazard.
+        Lower is easier. This shapes A*'s route selection.
+        """
+        t = self.tile(*p)
+        type_cost = {
+            TileType.PLAINS: 1.0,
+            TileType.ICE_FIELD: 2.5,
+            TileType.CANYON: 3.5,
+            TileType.CRATER: 2.0,
+            TileType.METAL_DEPOSIT: 2.0,
+        }[t.t]
+        # Hazard increases difficulty (0..1) → up to +75% cost
+        hazard_multiplier = 1.0 + 0.75 * t.hazard
+        return type_cost * hazard_multiplier
+
+    def move_cost(self, a: Tuple[int, int], b: Tuple[int, int]) -> float:
+        """
+        Directional cost used by A*. Adds a diagonal premium and a small
+        penalty for unrevealed tiles to encourage known-safe routes.
+        """
+        ax, ay = a
+        bx, by = b
+        base = 0.5 * (self.tile_base_cost(a) + self.tile_base_cost(b))
+        diag = math.sqrt(2) if (ax != bx and ay != by) else 1.0
+        unknown_penalty = 1.25 if not self.revealed(b) else 1.0
+        return base * diag * unknown_penalty
+
+    # ---- Path utilities ----
 
     def path_to(self, sx: int, sy: int, dx: int, dy: int) -> List[Tuple[int, int]]:
         """
         Simple Manhattan path; returns list including the destination but not the start.
+        (Kept for compatibility; used as a fallback if A* ever fails.)
         """
         path: List[Tuple[int, int]] = []
         x, y = sx, sy
@@ -137,6 +240,34 @@ class WorldMap:
             y += step_y
             path.append((x, y))
         return path
+
+    def pathfind(
+        self,
+        sx: int,
+        sy: int,
+        dx: int,
+        dy: int,
+        allow_diagonals: bool = True,
+    ) -> List[Tuple[int, int]]:
+        """
+        A*-based pathfinding. Returns a list of coordinates including the
+        destination but not the start (same contract as path_to()).
+        Falls back to Manhattan path if no route is found (should be rare).
+        """
+        start, goal = (sx, sy), (dx, dy)
+        if start == goal:
+            return []
+        res = astar(
+            start=start,
+            goal=goal,
+            passable=lambda p: self.passable(p),
+            move_cost=lambda a, b: self.move_cost(a, b),
+            allow_diagonals=allow_diagonals,
+        )
+        if res is None:
+            return self.path_to(sx, sy, dx, dy)
+        # Drop the start node to match expected path contract
+        return res.path[1:]
 
     def ascii_map(self, center_x: int = 0, center_y: int = 0, view_radius: int = 6) -> str:
         """
@@ -162,6 +293,21 @@ class WorldMap:
             lines.append("".join(row))
         lines.append("\nLegend: C=Colony  .=Plains  I=Ice  ^=Canyon  o=Crater  M=Metal  ░=Unknown")
         return "\n".join(lines)
+
+    # ---- Discovery / Visits ----
+
+    def reveal(self, x: int, y: int, radius: int = 0):
+        for yy in range(y - radius, y + radius + 1):
+            for xx in range(x - radius, x + radius + 1):
+                if not (-(self.w // 2) <= xx <= (self.w // 2)):
+                    continue
+                if not (-(self.h // 2) <= yy <= (self.h // 2)):
+                    continue
+                self._discovered.add((xx, yy))
+
+    def visit(self, x: int, y: int):
+        self._discovered.add((x, y))
+        self._visits[(x, y)] = self._visits.get((x, y), 0) + 1
 
     # ---- Serialization ----
 
@@ -210,9 +356,15 @@ class Expedition:
     step_index: int = 0
     cargo: Dict[str, float] = field(default_factory=dict)
 
+    # optional planning fields (not serialized)
+    planned_path: List[Tuple[int, int]] = field(default_factory=list, repr=False)
+    planned_eta_hours: Optional[float] = field(default=None, repr=False)
+    planned_cost: Optional[float] = field(default=None, repr=False)
+
     def __post_init__(self):
+        # Prefer A* route on construction if no path was pre-supplied
         if not self.path:
-            self.path = self.world.path_to(0, 0, self.dest[0], self.dest[1])
+            self.path = self.world.pathfind(0, 0, self.dest[0], self.dest[1], allow_diagonals=True)
 
     @property
     def active(self) -> bool:
@@ -222,6 +374,50 @@ class Expedition:
     def speed_steps_per_sol(self) -> float:
         # Rover halves the time (~2 steps per sol vs 1 on foot).
         return 2.0 if self.use_rover else 1.0
+
+    def current_position(self) -> Tuple[int, int]:
+        """
+        Best-effort estimate of the expedition's current map position.
+        During PREP or before the first move, it's the colony (0,0).
+        During travel, it's the last tile we stepped onto.
+        """
+        if self.status in (ExpeditionStatus.PREP,):
+            return (0, 0)
+        if self.step_index <= 0 or not self.path:
+            return (0, 0)
+        return self.path[self.step_index - 1]
+
+    def plan_route(self, target: Tuple[int, int], allow_diagonals: bool = True) -> bool:
+        """
+        Compute a route from the expedition's current position to `target`,
+        store it in `planned_path`, and estimate ETA (in hours).
+        Returns True if a plan was found.
+        """
+        start = self.current_position()
+        res = astar(
+            start=start,
+            goal=target,
+            passable=lambda p: self.world.passable(p),
+            move_cost=lambda a, b: self.world.move_cost(a, b),
+            allow_diagonals=allow_diagonals,
+        )
+        if not res:
+            self.planned_path = []
+            self.planned_eta_hours = None
+            self.planned_cost = None
+            return False
+
+        # A* path includes `start`; game path convention excludes it
+        self.planned_path = res.path[1:]
+        self.planned_cost = res.cost
+
+        # Convert abstract cost to time. We keep the sim's "steps/sol" speed model,
+        # so ETA is primarily path length driven; we can blend both notions.
+        # Here: 1 step ≈ 1 "unit" of time; rover doubles step rate.
+        steps = max(0, len(self.planned_path))
+        sols = steps / self.speed_steps_per_sol()
+        self.planned_eta_hours = sols * 24.0
+        return True
 
     def _rng(self) -> random.Random:
         r = random.Random()
@@ -360,6 +556,7 @@ class Expedition:
             "path": [list(p) for p in self.path],
             "step_index": self.step_index,
             "cargo": dict(self.cargo),
+            # planned_* are transient; intentionally not serialized
         }
 
     @classmethod
