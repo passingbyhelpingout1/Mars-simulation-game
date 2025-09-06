@@ -1,6 +1,6 @@
 # mars_colony.py
 # A compact, single-file starter for a Mars Colony simulation game.
-# Python 3.8+ / stdlib only.
+# Python 3.8+ / stdlib only. (Optional: pygame for a tile-based map viewer.)
 
 from __future__ import annotations
 
@@ -11,6 +11,147 @@ import sys
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
+
+# --------------------------- Optional GFX (pygame) ----------------------------
+# The game runs fully in the terminal. If pygame is installed, you can view the
+# world map with a simple tile renderer (pan with arrows, zoom with +/-).
+try:
+    import pygame  # type: ignore
+    _HAS_PYGAME = True
+except Exception:  # pragma: no cover
+    pygame = None  # type: ignore
+    _HAS_PYGAME = False
+
+
+def _color_for_char(ch: str) -> Tuple[int, int, int]:
+    """
+    Heuristic palette for common map ASCII glyphs. Unknown chars get a neutral tint.
+    """
+    base = {
+        " ": (12, 12, 14),   # void / fog
+        ".": (110, 78, 55),  # regolith
+        ",": (120, 86, 60),
+        "#": (120, 120, 130),  # rock / ridge
+        "H": (70, 110, 210),   # habitat
+        "S": (70, 170, 180),   # solar
+        "R": (240, 130, 40),   # rover
+        "W": (50, 120, 220),   # water / ice
+        "F": (70, 160, 70),    # food-ish
+        "M": (150, 150, 170),  # metals
+        "?": (40, 40, 55),     # unknown / unrevealed
+        "X": (160, 60, 160),   # anomaly
+        "+": (60, 60, 70),
+        "-": (60, 60, 70),
+        "|": (60, 60, 70),
+        "*": (180, 170, 80),
+        "~": (80, 90, 140),
+    }
+    if ch in base:
+        return base[ch]
+    if ch.isalpha():
+        return (120, 120, 180)
+    if ch.isdigit():
+        return (85, 85, 95)
+    return (100, 105, 115)
+
+
+if _HAS_PYGAME:
+
+    class PygameMapViewer:
+        """
+        Minimal tile renderer that draws a 2D character grid as colored tiles.
+        - Pan with arrow keys
+        - Zoom with +/- (or = on US keyboards)
+        - Close with Esc or Enter
+        """
+        def __init__(self, tile_px: int = 24, window_size: Tuple[int, int] = (1024, 768)) -> None:
+            pygame.init()
+            pygame.display.set_caption("Mars Map")
+            self.screen = pygame.display.set_mode(window_size)
+            self.clock = pygame.time.Clock()
+            try:
+                pygame.font.init()
+                self.font = pygame.font.SysFont(None, 16)
+            except Exception:
+                self.font = None
+            self.tile_px = tile_px
+            self.zoom = 1.0
+            self.cam_x = 0
+            self.cam_y = 0
+
+        def _handle_input(self) -> bool:
+            for e in pygame.event.get():
+                if e.type == pygame.QUIT:
+                    return False
+                if e.type == pygame.KEYDOWN and e.key in (pygame.K_ESCAPE, pygame.K_RETURN):
+                    return False
+            keys = pygame.key.get_pressed()
+            # pan speed in pixels per second
+            px = int(420 * max(1, self.clock.get_time()) / 1000)
+            if keys[pygame.K_LEFT]:
+                self.cam_x -= px
+            if keys[pygame.K_RIGHT]:
+                self.cam_x += px
+            if keys[pygame.K_UP]:
+                self.cam_y -= px
+            if keys[pygame.K_DOWN]:
+                self.cam_y += px
+            if keys[pygame.K_MINUS] or keys[pygame.K_KP_MINUS]:
+                self.zoom = max(0.5, self.zoom - 0.05)
+            if keys[pygame.K_EQUALS] or keys[pygame.K_KP_PLUS]:
+                self.zoom = min(3.0, self.zoom + 0.05)
+            return True
+
+        def _draw(self, grid: List[List[str]], hud_text: str = "") -> None:
+            ts = max(4, int(self.tile_px * self.zoom))
+            self.screen.fill((8, 8, 10))
+            h = len(grid)
+            w = len(grid[0]) if h else 0
+
+            # visible rect
+            start_x = max(0, self.cam_x // ts)
+            start_y = max(0, self.cam_y // ts)
+            tiles_x = self.screen.get_width() // ts + 2
+            tiles_y = self.screen.get_height() // ts + 2
+
+            ypix = - (self.cam_y % ts)
+            for gy in range(start_y, min(start_y + tiles_y, h)):
+                xpix = - (self.cam_x % ts)
+                row = grid[gy]
+                for gx in range(start_x, min(start_x + tiles_x, w)):
+                    ch = row[gx]
+                    pygame.draw.rect(self.screen, _color_for_char(ch), (xpix, ypix, ts, ts))
+                    # Optional letter overlay for clarity at larger sizes
+                    if self.font and ts >= 18 and ch.strip():
+                        surf = self.font.render(ch, True, (230, 230, 230))
+                        self.screen.blit(surf, (xpix + 3, ypix + 2))
+                    xpix += ts
+                ypix += ts
+
+            if self.font:
+                bar = self.font.render("←↑↓→ pan    +/- zoom    Esc/Enter close", True, (230, 230, 230))
+                self.screen.blit(bar, (8, 8))
+                if hud_text:
+                    hud = self.font.render(hud_text, True, (200, 200, 200))
+                    self.screen.blit(hud, (8, 28))
+
+        def run_once(self, grid: List[List[str]], title: str = "") -> None:
+            if title:
+                pygame.display.set_caption(title)
+            running = True
+            while running:
+                running = self._handle_input()
+                self._draw(grid, hud_text=title)
+                pygame.display.flip()
+                self.clock.tick(60)
+            # leave pygame initialized so it can be reused in the same session
+
+else:
+    # Stub to keep references safe if pygame is not available
+    class PygameMapViewer:  # type: ignore
+        def __init__(self, *_, **__): ...
+        def run_once(self, *_a, **_k): ...
+
 
 # Map / Expedition layer (keep map_layer.py next to this file)
 from map_layer import WorldMap, Expedition, ExpeditionStatus
@@ -444,6 +585,26 @@ def default_blueprints() -> Dict[str, Blueprint]:
     }
 
 
+def _world_to_char_grid(w: WorldMap) -> List[List[str]]:
+    """
+    Obtain a 2D character grid to render.
+    We ask the WorldMap for an ASCII view large enough to cover the whole world,
+    then convert the lines into a rectangular grid.
+    """
+    try:
+        half_w, half_h = w.w // 2, w.h // 2  # attributes used elsewhere in this file
+        radius = max(half_w, half_h)
+    except Exception:
+        radius = 10
+    s = w.ascii_map(0, 0, view_radius=radius)
+    lines = [ln.rstrip("\n") for ln in s.splitlines() if ln.strip() != ""]
+    width = max((len(ln) for ln in lines), default=0)
+    # Right-pad lines to equal width; keep all characters (including borders) so the
+    # visual roughly matches the ASCII output.
+    grid = [list(ln.ljust(width)) for ln in lines]
+    return grid
+
+
 @dataclass
 class Game:
     colony: Colony
@@ -455,6 +616,12 @@ class Game:
     # Map / Expedition state
     world: Optional[WorldMap] = None
     expedition: Optional[Expedition] = None
+
+    # Graphics toggle (set in new_game() based on pygame availability)
+    use_pygame_map: bool = False
+
+    # Non-serialized runtime viewer instance
+    _pg_viewer: Optional[PygameMapViewer] = field(default=None, repr=False, compare=False)
 
     # --------------------------- Event System ---------------------------------
 
@@ -551,12 +718,37 @@ class Game:
             )
             self.expedition = None
 
+    def _show_map_graphics(self):
+        """
+        If pygame is available, render a tile view of the whole world. Otherwise, noop.
+        """
+        if not self.use_pygame_map or not _HAS_PYGAME:
+            return
+        try:
+            grid = _world_to_char_grid(self.world)  # type: ignore[arg-type]
+            if not grid or not grid[0]:
+                return
+            if self._pg_viewer is None:
+                # Choose a tile size that tends to fit on a typical screen.
+                # If the map is bigger, you can pan/zoom.
+                tile_px = 24
+                self._pg_viewer = PygameMapViewer(tile_px=tile_px, window_size=(1024, 768))
+            title = f"Mars Map — Sol {self.env.sol}"
+            self._pg_viewer.run_once(grid, title=title)
+        except Exception as ex:
+            # If something goes wrong (e.g., headless environment), fall back silently.
+            self.log.append(f"(Map viewer unavailable: {ex})")
+
     def map_menu(self):
         self._ensure_world()
         w = self.world
         print("\n" + "=" * 64)
         print("Map / Expedition")
-        print(w.ascii_map(0, 0, view_radius=6))
+        # If graphics are enabled (and pygame is present), show the viewer; otherwise print ASCII.
+        if self.use_pygame_map and _HAS_PYGAME:
+            self._show_map_graphics()
+        else:
+            print(w.ascii_map(0, 0, view_radius=6))  # type: ignore[union-attr]
 
         if self.expedition and self.expedition.active:
             ex = self.expedition
@@ -575,7 +767,7 @@ class Game:
             return
 
         # Bounds check
-        half_w, half_h = w.w // 2, w.h // 2
+        half_w, half_h = w.w // 2, w.h // 2  # type: ignore[union-attr]
         if not (-half_w <= x <= half_w and -half_h <= y <= half_h):
             print("Destination outside world bounds.")
             return
@@ -622,6 +814,8 @@ class Game:
             "next_building_id": self.next_building_id,
             "world": self.world.to_dict() if self.world else None,
             "expedition": self.expedition.to_dict() if self.expedition else None,
+            # Include whether gfx was enabled
+            "use_pygame_map": self.use_pygame_map,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -644,6 +838,7 @@ class Game:
             self.expedition = Expedition.from_dict(self.world, edata)
         else:
             self.expedition = None
+        self.use_pygame_map = bool(data.get("use_pygame_map", self.use_pygame_map))
         self.log.append(f"📂 Loaded from {path}")
 
     # ------------------------------ UI Helpers --------------------------------
@@ -827,7 +1022,7 @@ class Game:
 
 # --------------------------- Game Initialization -----------------------------
 
-def new_game(colony_name: str = "Ares Base", seed: int = 42) -> Game:
+def new_game(colony_name: str = "Ares Base", seed: int = 42, force_no_gfx: bool = False) -> Game:
     blueprints = default_blueprints()
 
     # Starting state (tune freely)
@@ -871,19 +1066,25 @@ def new_game(colony_name: str = "Ares Base", seed: int = 42) -> Game:
     # Initialize world map with deterministic seed and reveal area around base
     game.world = WorldMap(21, 21, seed=seed)
     game.world.reveal(0, 0, radius=2)
+    # Enable pygame map if available, unless explicitly disabled
+    game.use_pygame_map = _HAS_PYGAME and not force_no_gfx
     return game
 
 
 def main():
+    # CLI flags:
+    #   --load     : load savegame.json
+    #   --no-gfx   : force terminal-only map (ignore pygame even if installed)
+    force_no_gfx = "--no-gfx" in sys.argv
     if len(sys.argv) > 1 and sys.argv[1] == "--load":
-        g = new_game()  # seed structure, will be overwritten by load
+        g = new_game(force_no_gfx=force_no_gfx)  # seed structure, will be overwritten by load
         try:
             g.load()
             print("Loaded savegame.json\n")
         except FileNotFoundError:
             print("No savegame.json found, starting new game.\n")
     else:
-        g = new_game()
+        g = new_game(force_no_gfx=force_no_gfx)
 
     g.main_menu()
 
