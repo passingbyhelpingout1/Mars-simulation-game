@@ -1,0 +1,2 @@
+Anyone is welcome to contribute code just submit a pull request - This game for now is a personal side project of mine inspired by the java game mars simulation project of which im also contributing https://github.com/mars-sim/mars-sim.  My inspiration was to learn python as well as java , this game will not be as complex and will probably diverge, but lessons i learn from this might be applicable to the java project
+So feel free to say hi, give feedback, add code if you want.  Screenshots or youtube videos if your are a content creator are always welcomed as well.
