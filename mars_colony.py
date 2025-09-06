@@ -12,6 +12,9 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
+# Map / Expedition layer (keep map_layer.py next to this file)
+from map_layer import WorldMap, Expedition, ExpeditionStatus
+
 
 # ----------------------------- Core Types ------------------------------------
 
@@ -98,6 +101,9 @@ class Colony:
     # Runtime only (not serialized)
     _rng: random.Random = field(default_factory=random.Random, repr=False, compare=False)
 
+    # Colonists reserved for expeditions (not available for auto-assignment)
+    reserved_for_expedition: int = 0
+
     def __post_init__(self):
         self._rng.seed(self.rng_seed)
         # Ensure all resources appear in inventory
@@ -147,7 +153,7 @@ class Colony:
     def worker_pool(self) -> int:
         # All colonists can work for now. You can add jobs/roles later.
         used = sum(min(b.assigned_workers, b.blueprint.workers_required) for b in self.buildings)
-        return max(0, self.population - used)
+        return max(0, self.population - self.reserved_for_expedition - used)
 
     def auto_assign_workers(self):
         """
@@ -155,7 +161,8 @@ class Colony:
         Priority order: water -> oxygen -> food -> metals -> everything else.
         """
         priorities = ["water_extractor", "electrolyzer", "greenhouse", "mine"]
-        available = self.population
+        # Respect expedition reservations so we don't over-assign
+        available = max(0, self.population - self.reserved_for_expedition)
         # Reset
         for b in self.buildings:
             b.assigned_workers = 0
@@ -334,6 +341,7 @@ class Colony:
             "buildings": [b.to_dict() for b in self.buildings],
             "rng_seed": self.rng_seed,
             "life_support_kw_per_colonist": self.life_support_kw_per_colonist,
+            "reserved_for_expedition": self.reserved_for_expedition,
         }
 
     @classmethod
@@ -365,6 +373,7 @@ class Colony:
         colony.buildings = buildings
         colony.capacity += colony.total_capacity_bonus()
         colony.__post_init__()
+        colony.reserved_for_expedition = int(data.get("reserved_for_expedition", 0))
         return colony
 
 
@@ -443,6 +452,10 @@ class Game:
     next_building_id: int = 1
     log: List[str] = field(default_factory=list)
 
+    # Map / Expedition state
+    world: Optional[WorldMap] = None
+    expedition: Optional[Expedition] = None
+
     # --------------------------- Event System ---------------------------------
 
     def random_event(self):
@@ -506,8 +519,99 @@ class Game:
         gen, need, util = self.colony.run_production(self.env, self.log)
         self.colony.life_support(self.log)
         self.random_event()
+        # Expeditions progress after core colony processing
+        self._progress_expedition()
         self.end_of_sol()
         return gen, need, util
+
+    # ------------------------- Exploration Layer ------------------------------
+
+    def _ensure_world(self):
+        if self.world is None:
+            # world seeded from colony seed for deterministic layout
+            self.world = WorldMap(21, 21, seed=self.colony.rng_seed)
+            # reveal a small area around the base
+            self.world.reveal(0, 0, radius=2)
+
+    def _progress_expedition(self):
+        if not self.expedition or not self.expedition.active:
+            return
+        logs, cargo, finished = self.expedition.tick(self.colony, self.env)
+        self.log.extend(logs)
+        if finished:
+            # Deliver cargo and free workers
+            for k, v in cargo.items():
+                try:
+                    res = Resource[k.upper()]
+                    self.colony.inventory[res] += v
+                except KeyError:
+                    pass
+            self.colony.reserved_for_expedition = max(
+                0, self.colony.reserved_for_expedition - self.expedition.team_size
+            )
+            self.expedition = None
+
+    def map_menu(self):
+        self._ensure_world()
+        w = self.world
+        print("\n" + "=" * 64)
+        print("Map / Expedition")
+        print(w.ascii_map(0, 0, view_radius=6))
+
+        if self.expedition and self.expedition.active:
+            ex = self.expedition
+            print(f"\nActive expedition: team={ex.team_size}, rover={'yes' if ex.use_rover else 'no'}, "
+                  f"dest={ex.dest}, status={ex.status.value}, progress_step={ex.step_index}/{len(ex.path)}")
+            input("Press Enter to return...")
+            return
+
+        # No active expedition -> allow launching one
+        print("\nLaunch a new expedition from (0,0). Coordinates are relative to colony.")
+        try:
+            x = int(input("Destination X (e.g., 3): ").strip())
+            y = int(input("Destination Y (e.g., -2): ").strip())
+        except Exception:
+            print("Invalid coordinates.")
+            return
+
+        # Bounds check
+        half_w, half_h = w.w // 2, w.h // 2
+        if not (-half_w <= x <= half_w and -half_h <= y <= half_h):
+            print("Destination outside world bounds.")
+            return
+
+        available_team_max = max(0, self.colony.population - self.colony.reserved_for_expedition)
+        if available_team_max <= 0:
+            print("No available colonists to send (all reserved/assigned).")
+            return
+
+        try:
+            team = int(input(f"Team size (1..{available_team_max}): ").strip())
+        except Exception:
+            print("Invalid team size.")
+            return
+        if team < 1 or team > available_team_max:
+            print("Team size out of range.")
+            return
+
+        use_rover = input("Use rover? (y/n) [y]: ").strip().lower() != "n"
+        # Optional cost to use rover
+        if use_rover:
+            fuel_cost = 1
+            if self.colony.inventory.get(Resource.FUEL, 0.0) < fuel_cost:
+                print("Not enough Fuel to use rover (need 1). Launching on foot.")
+                use_rover = False
+            else:
+                self.colony.inventory[Resource.FUEL] -= fuel_cost
+                self.log.append("🛻 Rover prepped (-1 Fuel).")
+
+        # Reserve workers and start
+        self.colony.reserved_for_expedition += team
+        self.expedition = Expedition(
+            world=w, dest=(x, y), team_size=team, use_rover=use_rover,
+            seed=self.colony._rng.randint(0, 10**9)
+        )
+        self.log.append(f"🧭 Expedition prepared to {x},{y} (team {team}, rover={'yes' if use_rover else 'no'}).")
 
     # --------------------------- Save / Load ----------------------------------
 
@@ -516,6 +620,8 @@ class Game:
             "env": asdict(self.env),
             "colony": self.colony.to_dict(),
             "next_building_id": self.next_building_id,
+            "world": self.world.to_dict() if self.world else None,
+            "expedition": self.expedition.to_dict() if self.expedition else None,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -527,6 +633,17 @@ class Game:
         self.env = Environment(**data["env"])
         self.colony = Colony.from_dict(data["colony"], self.blueprints)
         self.next_building_id = int(data.get("next_building_id", 1))
+        # map / expedition (handle older saves gracefully)
+        wdata = data.get("world")
+        if wdata:
+            self.world = WorldMap.from_dict(wdata)
+        else:
+            self.world = None
+        edata = data.get("expedition")
+        if edata and self.world:
+            self.expedition = Expedition.from_dict(self.world, edata)
+        else:
+            self.expedition = None
         self.log.append(f"📂 Loaded from {path}")
 
     # ------------------------------ UI Helpers --------------------------------
@@ -565,6 +682,12 @@ class Game:
                 print("  •", tag)
         else:
             print("Buildings: none")
+
+        # Expedition quick status
+        if self.expedition and self.expedition.active:
+            ex = self.expedition
+            print(f"\nExpedition: team={ex.team_size}, rover={'yes' if ex.use_rover else 'no'}, "
+                  f"dest={ex.dest}, status={ex.status.value}, step {ex.step_index}/{len(ex.path)}")
 
         if self.log:
             print("\nEvents/Notes:")
@@ -667,6 +790,7 @@ class Game:
             print(" 4) Save game")
             print(" 5) Load game")
             print(" 6) End Sol")
+            print(" 7) Map / Expedition")
             print(" 0) Quit")
             choice = input("Select action: ").strip()
 
@@ -692,6 +816,8 @@ class Game:
                     self.print_status()
                     print("\nAll colonists lost. Simulation ends.")
                     return
+            elif choice == "7":
+                self.map_menu()
             elif choice == "0":
                 print("Goodbye.")
                 return
@@ -742,6 +868,9 @@ def new_game(colony_name: str = "Ares Base", seed: int = 42) -> Game:
         colony.capacity += bp.capacity_bonus
 
     game = Game(colony=colony, blueprints=blueprints, next_building_id=next_id)
+    # Initialize world map with deterministic seed and reveal area around base
+    game.world = WorldMap(21, 21, seed=seed)
+    game.world.reveal(0, 0, radius=2)
     return game
 
 
